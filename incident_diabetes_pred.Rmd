@@ -1,0 +1,354 @@
+---
+title: "Incident Diabetes Prediction Project"
+author: "Pedram Doroudchi"
+date: "2024-05-05"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+library(openxlsx)
+library(xgboost)
+library(tidyverse)
+library(factoextra)
+library(cluster)
+library(rstatix)
+library(infotheo)
+library(car)
+library(caret)
+library(randomForest)
+library(class)
+library(glmnet)
+library(smotefamily)
+library(e1071)
+library(neuralnet)
+
+options(max.print = 1000000)
+
+set.seed(1)
+
+setwd('/Users/pedramdoroudchi/Documents/projects/sapient')
+```
+
+## Data Ingestion and Cleaning
+
+```{r}
+# read data
+dat0 <- read.csv('test_project_data.csv', row.names = 1)
+
+# get names of non-mtb columns
+names(dat0)[!grepl('mtb', names(dat0))]
+```
+
+```{r}
+# relocate non-mtb columns to front of dataset
+dat <- dat0 %>% relocate(BMI:diabetes_followup_time)
+
+# drop observations with prevalent diabetes since they cannot develop incident diabetes
+dat <- dat %>% 
+  filter(prevalent_diabetes != 1) %>% 
+  select(-prevalent_diabetes)
+
+# drop diabetes_followup_time to prevent target leakage
+dat <- dat %>% 
+  select(-diabetes_followup_time)
+
+# encode sex feature
+dat <- dat %>% 
+  mutate(
+    female = ifelse(sex == 'female', 1, 0)
+  ) %>% 
+  relocate(female, .before = sex) %>% 
+  select(-sex)
+
+# get NA counts for first 10 rows
+head(rowSums(is.na(dat)), 10)
+```
+
+```{r}
+# get NA counts by column
+head(colSums(is.na(dat)), 10)
+```
+
+```{r}
+# drop NA BMI values
+dat <- dat %>% 
+  filter(!is.na(BMI))
+
+# get histogram of row NA counts
+hist(rowSums(is.na(dat)))
+```
+
+```{r}
+# get histogram of column NA counts
+hist(colSums(is.na(dat)))
+```
+
+To deal with the large amount of NA values in the biomarker columns, let's impute these missing values with uniformly randomly generated numbers between 0 and the minimum value of the column since a missing value is usually due to the extremely low abundance of that biomarker in blood samples.
+
+Before we do that, we should split our data into training and testing sets so that there is no information leakage. We will use a 70/30 train/test split.
+
+```{r}
+# split data into training and testing
+train_dat <- rbind(
+  dat %>% filter(incident_diabetes == 0) %>% slice_sample(prop = 0.7),
+  dat %>% filter(incident_diabetes == 1) %>% slice_sample(prop = 0.7)
+  )
+test_dat <- dat[!(rownames(dat) %in% rownames(train_dat)), ]
+
+# impute biomarker NA values
+train_dat <- train_dat %>% 
+  mutate(
+    across(
+      !female & !incident_diabetes, 
+      ~ ifelse(is.na(.x), runif(sum(is.na(.x)), 0, min(.x, na.rm = T)), .x)
+    )
+  )
+
+test_dat <- test_dat %>% 
+  mutate(
+    across(
+      !female & !incident_diabetes, 
+      ~ ifelse(is.na(.x), runif(sum(is.na(.x)), 0, min(.x, na.rm = T)), .x)
+    )
+  )
+
+# get summary statistics for first 10 biomarker columns
+summary(train_dat[ , 1:10])
+```
+
+Since the biomarker columns generally have large values and to avoid the impact of extreme outliers, let's take the log transform of the biomarker columns and then standardize all continuous numeric columns.
+
+```{r}
+# take log transform of biomarker columns and standardize
+train_dat <- train_dat %>% 
+  mutate(
+    across(!any_of(c('female', 'incident_diabetes', 'BMI', 'age')), ~ log(1 + .x)),
+    across(!any_of(c('female', 'incident_diabetes')), ~ (.x - mean(.x)) / sd(.x)),
+    female = factor(female),
+    incident_diabetes = factor(incident_diabetes)
+  )
+
+test_dat <- test_dat %>% 
+  mutate(
+    across(!any_of(c('female', 'incident_diabetes', 'BMI', 'age')), ~ log(1 + .x)),
+    across(!any_of(c('female', 'incident_diabetes')), ~ (.x - mean(.x)) / sd(.x)),
+    female = factor(female),
+    incident_diabetes = factor(incident_diabetes)
+  )
+
+# get summary statistics for first 10 biomarker columns
+summary(train_dat[ , 1:10])
+```
+
+Next to assess which biomarkers are most associated with incident diabetes, we will run a logistic regression of incident_diabetes against each individual biomarker alongside covariates BMI, age, and sex on training data.
+
+Since there's a significant class imbalance between negative and positive incident diabetes cases (\~ 10:1), we could utilize SMOTE (synthetic minority oversampling technique) to synthetically balance the classes in our training set. However, to avoid overfitting we will train our model with class weights to account for the class imbalance.
+
+```{r}
+#X_train <- train_dat %>% 
+#  select(-incident_diabetes) %>% 
+#  mutate(female = ifelse(female == 1, 1, 0))
+#y_train <- train_dat$incident_diabetes
+#
+#
+## SMOTE
+#train_dat <- SMOTE(X_train, y_train)$dat %>% 
+#  mutate(incident_diabetes = ifelse(class == '1', 1, 0), .keep = 'unused') %>% 
+#  mutate(
+#    female = factor(as.integer(round(female))),
+#    incident_diabetes = factor(incident_diabetes)
+#  ) %>% 
+#  relocate(incident_diabetes)
+
+
+# run for-loop of logistic regression on each biomarker and record coefficient p-value
+p_vals <- c()
+for (i in 5:ncol(train_dat)) {
+  model_formula <- 
+    as.formula(
+      paste0(
+        'incident_diabetes ~ BMI + age + female + ', 
+        names(train_dat)[i]
+      )
+    )
+  model <- glm(
+    model_formula, 
+    data = train_dat, 
+    family = binomial,
+    weights = ifelse(incident_diabetes == 1, 10, 1)
+  )
+  p_vals[i-4] <- coef(summary(model))[5,4]
+  names(p_vals)[i-4] <- names(train_dat)[i]
+}
+
+# histogram of p-values
+hist(p_vals)
+```
+
+We see that about half of the biomarkers have significant logistic regression coefficients at the 5% level. Let's see the 10 most significant biomarkers.
+
+```{r}
+head(sort(p_vals), 10)
+```
+
+
+## Q2
+
+How can we use blood biomarkers to predict the risk of developing incident diabetes?
+
+Now that we have a sense of the biomarkers with the most significant effect in predicting incident diabetes, let's filter our dataset down to the most significant biomarkers (p \< 0.05) and apply PCA for further dimension reduction and to prevent multicollinearity.
+
+```{r}
+signif_mtbs <- names(p_vals[p_vals < 0.05])
+
+train_dat <- train_dat %>% 
+  mutate(
+    female = ifelse(female == 1, 1, 0),
+    incident_diabetes = ifelse(incident_diabetes == 1, 1, 0)
+  ) %>% 
+  select(
+    BMI,
+    age,
+    female,
+    incident_diabetes,
+    all_of(signif_mtbs)
+  )
+
+X_train <- train_dat %>% select(-incident_diabetes)
+y_train <- train_dat$incident_diabetes
+
+test_dat <- test_dat %>% 
+  mutate(
+    female = ifelse(female == 'female', 1, 0),
+    incident_diabetes = ifelse(incident_diabetes == 0, 0, 1)
+  ) %>% 
+  select(
+    BMI,
+    age,
+    female,
+    incident_diabetes,
+    all_of(signif_mtbs)
+  )
+
+X_test <- test_dat %>% select(-incident_diabetes)
+y_test <- test_dat$incident_diabetes
+
+
+# PCA - finds orthogonal components in order of decreasing explained variance
+pc <- prcomp(X_train %>% select(-female))
+
+# plot cumulative explained variance of first 100 PC's
+plot(cumsum(pc$sdev^2 / sum(pc$sdev^2)), 
+     xlim = c(0,100), 
+     type="b", 
+     xlab = "# of PC's", 
+     ylab = 'Cumulative Proportion of Explained Variance'
+     )
+```
+
+We can see that the "elbow" of the cumulative explained variance plot above occurs around the 20th PC, so we will retain the first 20 PC's.
+
+To potentially help improve predictive performance, we will run K-means clustering with K = 2 on the training data and then "fit" the best cluster assignment on each test data observation.
+
+```{r}
+X_train_pca <- as.data.frame(pc$x)[,1:20]
+X_test_pca <- as.data.frame(predict(pc, X_test %>% select(-female)))[,1:20]
+
+
+# K-means clustering
+km <- kmeans(X_train_pca, centers = 2)
+
+X_train_pca$cluster <- as.factor(km$cluster)
+
+km_centers <- km$centers
+
+test_clusters <- c()
+center_distances <- c()
+for (r in 1:nrow(X_test_pca)) {
+  center_distances[1] <- sum((X_test_pca[r,] - km_centers[1,])^2)
+  center_distances[2] <- sum((X_test_pca[r,] - km_centers[2,])^2)
+  test_clusters[r] <- which.min(center_distances)
+}
+
+X_test_pca$cluster <- as.factor(test_clusters)
+
+
+# weighted logistic regression - logit-transformed linear regression
+lr <- 
+  glm(
+    incident_diabetes ~ ., 
+    data = 
+      cbind(
+        incident_diabetes = as.factor(y_train), 
+        female = as.factor(X_train$female), 
+        X_train_pca
+      ),
+    family = binomial,
+    weights = ifelse(incident_diabetes == 1, 10, 1)
+  )
+summary(lr)
+```
+
+```{r}
+# get LR test predictions and compute confusion matrix
+y_pred <- 
+  predict(
+    lr, 
+    cbind(female = as.factor(X_test$female), X_test_pca), 
+    type = 'response'
+  )
+
+y_pred <- ifelse(y_pred > 0.5, 1, 0)
+
+confusionMatrix(table(y_pred, y_test), positive = '1')
+```
+
+```{r}
+# weighted SVM - finds optimal sigmoid hyperplane between classes
+svm <- 
+  svm(
+    incident_diabetes ~ ., 
+    data = cbind(
+      incident_diabetes = factor(y_train), 
+      female = as.factor(X_train$female), 
+      X_train_pca
+    ),
+    kernel = 'sigmoid',
+    class.weights = c('0' = 1, '1' = 10)
+  )
+
+# get test predictions and create confusion matrix
+y_pred <- predict(svm, cbind(female = as.factor(X_test$female), X_test_pca), type = 'raw')
+
+confusionMatrix(table(y_pred, y_test), positive = '1')
+```
+
+```{r}
+# weighted XGB - extreme gradient boosted tree
+xgb <- 
+  xgboost(
+    data = data.matrix(cbind(female = X_train$female, X_train_pca)), 
+    label = y_train,
+    weight = ifelse(y_train == 1, 10, 1),
+    nrounds = 5,
+    objective = 'binary:hinge'
+  )
+
+# get test predictions and create confusion matrix
+y_pred <- predict(xgb, data.matrix(cbind(female = X_test$female, X_test_pca)))
+
+confusionMatrix(table(y_pred, y_test), positive = '1')
+```
+
+Comparing the confusion matrices for the three different models above, we can see that logistic regression comes out on top overall. It offers solid predictive performance with solid sensitivity of 0.71 and specificity of 0.72, yielding a balanced accuracy of 0.71. However, the major weakness of the model is the positive predictive value of about 0.20, meaning the model is more sensitive at the cost of predicting more false positive results. In the context of disease prediction, a false positive may be preferable to a false negative but ideally we would like to minimize both.
+
+Future considerations for model improvement include:
+
+-   Finding a more accurate imputation method for missing biomarker data
+-   Gathering more data (especially positive cases) and/or explanatory features
+-   Trying other machine learning models and applying hyperparameter optimization
+
